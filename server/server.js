@@ -5,6 +5,14 @@
 // - Socket.IO: 실시간 멀티플레이 / 룸 관리
 // - sqlite3: 사용자 조각(실제 DB 컬럼명 chips) 저장
 // - 권위적 서버 모델: 카드/족보/배팅/승패/조각 정산을 서버가 전부 결정
+//
+// 이번 수정 핵심
+// 1) 올인(All-in) 지원
+//    - 상대 베팅이 너무 커도 "조각 부족"으로 막지 않고,
+//      내가 가진 전부만큼은 낼 수 있게 변경했습니다.
+// 2) 사이드팟(부분 판돈) 정산 지원
+//    - 예: 내가 100, 상대가 1000이면 내가 이겨도 최대 200만 획득
+//    - 남는 초과 금액은 실제 승부 가능한 범위에 맞춰 자동 정산됩니다.
 // -----------------------------------------------------------------------------
 
 const path = require('path');
@@ -38,7 +46,6 @@ const BASE_ANTE = 1; // 매 판 참가비 1조각
 const AUTO_RESTART_DELAY_MS = 5000; // 판 종료 후 5초 뒤 자동 재시작
 
 // 개발자/관리자 설정.
-// .env 또는 Glitch의 환경 변수에서 바꿀 수 있습니다.
 const DEV_NICK = process.env.DEV_NICK || 'DEV_MASTER';
 const ADMIN_SECRET = process.env.ADMIN_SECRET || 'CHANGE_ME';
 
@@ -46,27 +53,20 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-// Express 정적 파일 서비스
 app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// 아주 간단한 상태 확인용 라우트
 app.get('/health', (req, res) => {
   res.json({ ok: true });
 });
 
 // 메모리 기반 룸 상태 저장소
-// 실제 영구 저장이 필요한 것은 조각 잔액(users)이므로,
-// 게임 중 임시 상태(방, 카드, 턴, 판돈)는 메모리에 둡니다.
 const rooms = new Map();
 
-// 같은 닉네임의 중복 접속을 막기 위한 맵
-// key: nickname, value: socket.id
+// 같은 닉네임 중복 접속 방지
 const onlineNicknameToSocketId = new Map();
 
 /**
  * 닉네임 유효성 검사.
- * - 한글/영문/숫자/밑줄 허용
- * - 2~12자 제한
  */
 function validateNickname(rawNickname) {
   const nickname = String(rawNickname || '').trim();
@@ -83,7 +83,7 @@ function validateNickname(rawNickname) {
 }
 
 /**
- * 6자리 방 코드를 생성합니다.
+ * 6자리 방 코드 생성
  */
 function generateRoomCode() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -100,8 +100,7 @@ function generateRoomCode() {
 }
 
 /**
- * 룸 메세지 로그를 남깁니다.
- * 최근 메세지만 유지하여 상태 패킷이 과도하게 커지지 않게 합니다.
+ * 룸 내 최근 로그 메세지 저장
  */
 function addRoomMessage(room, text) {
   room.messages.push({
@@ -113,7 +112,6 @@ function addRoomMessage(room, text) {
     room.messages = room.messages.slice(-20);
   }
 }
-
 
 function clearAutoRestart(room) {
   if (room.autoRestartTimer) {
@@ -142,23 +140,14 @@ function scheduleAutoRestart(room) {
   }, AUTO_RESTART_DELAY_MS);
 }
 
-/**
- * 현재 룸에 남아 있는 플레이어 id 배열을 반환합니다.
- */
 function getRoomPlayerIds(room) {
   return room.players.map((p) => p.id);
 }
 
-/**
- * 특정 룸에서 플레이어 객체를 찾습니다.
- */
 function getPlayerFromRoom(room, playerId) {
   return room.players.find((player) => player.id === playerId) || null;
 }
 
-/**
- * DB의 현재 조각(chips) 값을 룸 캐시에 동기화합니다.
- */
 async function syncPlayerPieces(room, playerId) {
   const user = await getUser(playerId);
   const player = getPlayerFromRoom(room, playerId);
@@ -167,9 +156,6 @@ async function syncPlayerPieces(room, playerId) {
   }
 }
 
-/**
- * DB와 룸 캐시를 동시에 조정하는 헬퍼.
- */
 async function changePlayerPieces(room, playerId, delta) {
   const updatedUser = await adjustChips(playerId, delta);
   const player = getPlayerFromRoom(room, playerId);
@@ -180,13 +166,12 @@ async function changePlayerPieces(room, playerId, delta) {
 }
 
 /**
- * 룸 상태를 클라이언트에 보내기 전에 가공합니다.
- * 각 플레이어는 '자기 카드만' 보고,
- * 쇼다운/마지막 결과 화면에서는 공개 가능한 카드만 보도록 설계했습니다.
+ * 상태를 각 플레이어에 맞게 가공
  */
 function buildStateForPlayer(room, viewerId) {
   const isHost = room.hostId === viewerId;
   const isDeveloper = viewerId === DEV_NICK;
+  const myState = room.game?.playerStates?.[viewerId] || null;
 
   const state = {
     roomCode: room.code,
@@ -204,6 +189,7 @@ function buildStateForPlayer(room, viewerId) {
         id: player.id,
         pieces: player.pieces,
         folded: gameState ? !!gameState.folded : !!lastResultState?.folded,
+        allIn: gameState ? !!gameState.allIn : !!lastResultState?.allIn,
         currentBet: gameState ? gameState.currentBet : 0,
         totalContribution: gameState ? gameState.totalContribution : lastResultState?.totalContribution || 0,
         cardCount: gameState?.cards?.length || 0,
@@ -224,13 +210,12 @@ function buildStateForPlayer(room, viewerId) {
           currentBet: room.game.currentBet,
           currentTurnPlayerId: room.game.currentTurnPlayerId,
           needResponseFrom: Array.from(room.game.needResponseFrom),
-          myCards: (room.game.playerStates[viewerId]?.cards || []).map(formatCard),
-          myFolded: !!room.game.playerStates[viewerId]?.folded,
-          myCurrentBet: room.game.playerStates[viewerId]?.currentBet || 0,
-          myTotalContribution: room.game.playerStates[viewerId]?.totalContribution || 0,
-          myHandSummary: room.game.playerStates[viewerId]?.cards?.length === 2
-            ? summarizeHand(room.game.playerStates[viewerId].cards)
-            : null,
+          myCards: (myState?.cards || []).map(formatCard),
+          myFolded: !!myState?.folded,
+          myAllIn: !!myState?.allIn,
+          myCurrentBet: myState?.currentBet || 0,
+          myTotalContribution: myState?.totalContribution || 0,
+          myHandSummary: myState?.cards?.length === 2 ? summarizeHand(myState.cards) : null,
         }
       : null,
     lastResult: room.lastResult,
@@ -238,7 +223,11 @@ function buildStateForPlayer(room, viewerId) {
     messages: room.messages,
     controls: {
       canStart: isHost && room.status === 'lobby' && room.players.length >= MIN_PLAYERS,
-      canAct: room.status === 'playing' && room.game?.currentTurnPlayerId === viewerId,
+      canAct:
+        room.status === 'playing' &&
+        room.game?.currentTurnPlayerId === viewerId &&
+        !myState?.folded &&
+        !myState?.allIn,
     },
     developerTools: {
       enabled: isDeveloper,
@@ -249,26 +238,16 @@ function buildStateForPlayer(room, viewerId) {
   return state;
 }
 
-/**
- * 룸에 있는 모든 소켓에 각자 맞춤형 상태를 전송합니다.
- */
 function emitRoomState(room) {
   for (const player of room.players) {
     io.to(player.socketId).emit('roomState', buildStateForPlayer(room, player.id));
   }
 }
 
-/**
- * 특정 소켓에만 에러 전달.
- */
 function emitError(socket, message) {
   socket.emit('errorMessage', message);
 }
 
-/**
- * 배열을 특정 인덱스 기준으로 회전합니다.
- * 예: [A,B,C,D], startIndex=2 => [C,D,A,B]
- */
 function rotateArray(arr, startIndex) {
   if (arr.length === 0) return [];
   const index = ((startIndex % arr.length) + arr.length) % arr.length;
@@ -276,7 +255,8 @@ function rotateArray(arr, startIndex) {
 }
 
 /**
- * 현재 게임에서 아직 살아 있는(폴드하지 않은) 플레이어 ID 목록.
+ * 아직 살아 있는 플레이어(다이하지 않은 플레이어)
+ * - 올인은 했어도 살아있으면 showdown 대상이므로 포함됩니다.
  */
 function getActivePlayerIds(room) {
   if (!room.game) return [];
@@ -284,10 +264,33 @@ function getActivePlayerIds(room) {
 }
 
 /**
- * 다음 행동할 플레이어를 찾습니다.
- * needResponseFrom 집합에 포함되고, 아직 폴드하지 않은 사람 중에서
- * 현재 사람 다음 순서의 플레이어를 찾습니다.
+ * 실제로 추가 행동이 가능한 플레이어
+ * - 다이 아님
+ * - 올인 아님
  */
+function getActionablePlayerIds(room) {
+  if (!room.game) return [];
+  return room.game.turnOrder.filter((playerId) => {
+    const state = room.game.playerStates[playerId];
+    return !state.folded && !state.allIn;
+  });
+}
+
+/**
+ * 레이즈 후 누가 다시 응답해야 하는지 계산
+ * - 현재 최고 베팅보다 적게 넣은 사람만 다시 응답 대상
+ * - 올인 플레이어는 더 이상 응답 대상에 넣지 않음
+ */
+function rebuildNeedResponseFrom(room, actorId) {
+  const ids = getActionablePlayerIds(room).filter((id) => {
+    if (id === actorId) return false;
+    const state = room.game.playerStates[id];
+    return state.currentBet < room.game.currentBet;
+  });
+
+  room.game.needResponseFrom = new Set(ids);
+}
+
 function findNextTurnPlayer(room, afterPlayerId) {
   const game = room.game;
   if (!game) return null;
@@ -304,15 +307,14 @@ function findNextTurnPlayer(room, afterPlayerId) {
     const candidateId = order[index];
     const candidateState = game.playerStates[candidateId];
 
-    if (!candidateState.folded && game.needResponseFrom.has(candidateId)) {
+    if (!candidateState.folded && !candidateState.allIn && game.needResponseFrom.has(candidateId)) {
       return candidateId;
     }
   }
 
-  // 혹시 기준 플레이어를 못 찾은 경우를 대비한 fallback
   for (const playerId of order) {
     const state = game.playerStates[playerId];
-    if (!state.folded && game.needResponseFrom.has(playerId)) {
+    if (!state.folded && !state.allIn && game.needResponseFrom.has(playerId)) {
       return playerId;
     }
   }
@@ -320,9 +322,6 @@ function findNextTurnPlayer(room, afterPlayerId) {
   return null;
 }
 
-/**
- * 룸이 비었으면 삭제합니다.
- */
 function cleanupEmptyRoom(roomCode) {
   const room = rooms.get(roomCode);
   if (!room) return;
@@ -333,9 +332,6 @@ function cleanupEmptyRoom(roomCode) {
   }
 }
 
-/**
- * 플레이어가 룸에서 나가거나 연결이 끊겼을 때 처리합니다.
- */
 async function removePlayerFromRoom(socket, reasonText = '방을 나갔습니다.') {
   const roomCode = socket.data.roomCode;
   const playerId = socket.data.nickname;
@@ -360,7 +356,6 @@ async function removePlayerFromRoom(socket, reasonText = '방을 나갔습니다
     return;
   }
 
-  // 게임 중 퇴장이라면, 해당 플레이어는 자동 폴드 처리합니다.
   if (room.status === 'playing' && room.game?.playerStates?.[playerId]) {
     room.game.playerStates[playerId].folded = true;
     room.game.needResponseFrom.delete(playerId);
@@ -374,13 +369,11 @@ async function removePlayerFromRoom(socket, reasonText = '방을 나갔습니다
   delete socket.data.roomCode;
   delete socket.data.nickname;
 
-  // 방장이 나가면 남은 첫 번째 플레이어를 새 방장으로 지정합니다.
   if (room.hostId === playerId && room.players.length > 0) {
     room.hostId = room.players[0].id;
     addRoomMessage(room, `방장이 나가 새 방장이 ${room.hostId}님으로 변경되었습니다.`);
   }
 
-  // 게임 도중 인원이 1명만 남으면 남은 사람이 자동 승리합니다.
   if (room.status === 'playing' && room.players.length <= 1) {
     if (room.players.length === 1) {
       await finishRound(room, [room.players[0].id], '상대가 모두 나가 자동 승리했습니다.');
@@ -401,91 +394,165 @@ async function removePlayerFromRoom(socket, reasonText = '방을 나갔습니다
 }
 
 /**
- * 판 종료 후 결과 정산.
+ * 사이드팟 포함 정산 계산
+ *
+ * 예시
+ * - A 100 올인, B 1000 베팅
+ * - 실승부 판돈은 100 vs 100 = 200
+ * - 나머지 900은 B 혼자 만든 상단 티어라 B에게 돌아감
  */
-async function finishRound(room, winnerIds, reason) {
+function calculatePayoutsAndHistory(room, timestamp) {
+  const game = room.game;
+  const payouts = {};
+  const historyRows = [];
+
+  for (const playerId of game.turnOrder) {
+    payouts[playerId] = 0;
+  }
+
+  const contributionLevels = [...new Set(
+    game.turnOrder
+      .map((playerId) => game.playerStates[playerId].totalContribution)
+      .filter((value) => value > 0)
+  )].sort((a, b) => a - b);
+
+  let previousLevel = 0;
+
+  for (const level of contributionLevels) {
+    const tierAmountPerPlayer = level - previousLevel;
+    previousLevel = level;
+
+    if (tierAmountPerPlayer <= 0) continue;
+
+    const contributors = game.turnOrder.filter(
+      (playerId) => game.playerStates[playerId].totalContribution >= level
+    );
+
+    if (contributors.length === 0) continue;
+
+    const potAmount = tierAmountPerPlayer * contributors.length;
+    const eligibleIds = contributors.filter((playerId) => !game.playerStates[playerId].folded);
+
+    // 드물지만 이 티어에 살아남은 플레이어가 없으면, 넣은 사람들에게 그대로 반환
+    if (eligibleIds.length === 0) {
+      for (const contributorId of contributors) {
+        payouts[contributorId] += tierAmountPerPlayer;
+      }
+      continue;
+    }
+
+    const winnerEntries = eligibleIds.map((playerId) => ({
+      playerId,
+      hand: game.playerStates[playerId].hand,
+    }));
+    const winners = findWinners(winnerEntries).map((entry) => entry.playerId);
+
+    const shareBase = Math.floor(potAmount / winners.length);
+    let shareRemainder = potAmount % winners.length;
+
+    for (const winnerId of winners) {
+      payouts[winnerId] += shareBase + (shareRemainder > 0 ? 1 : 0);
+      if (shareRemainder > 0) shareRemainder -= 1;
+    }
+
+    // 전적 기록용 행 생성
+    // 각 패자는 이번 티어에서 tierAmountPerPlayer 만큼 잃었습니다.
+    const losers = contributors.filter((playerId) => !winners.includes(playerId));
+
+    for (const loserId of losers) {
+      const lostThisTier = tierAmountPerPlayer;
+      const rowBase = Math.floor(lostThisTier / winners.length);
+      let rowRemainder = lostThisTier % winners.length;
+
+      for (const winnerId of winners) {
+        const betAmount = rowBase + (rowRemainder > 0 ? 1 : 0);
+        if (rowRemainder > 0) rowRemainder -= 1;
+
+        if (betAmount > 0) {
+          historyRows.push({
+            winner_id: winnerId,
+            loser_id: loserId,
+            bet_amount: betAmount,
+            timestamp,
+          });
+        }
+      }
+    }
+  }
+
+  return { payouts, historyRows };
+}
+
+/**
+ * 판 종료 후 결과 정산
+ */
+async function finishRound(room, winnerIdsForMessage, reason) {
   const game = room.game;
   if (!game) return;
 
   const timestamp = new Date().toISOString();
   const resultPlayers = [];
 
-  // 쇼다운이 필요한 경우(2명 이상 살아남음) 패 계산
+  // 살아남은 플레이어들의 패 계산
   for (const playerId of game.turnOrder) {
     const state = game.playerStates[playerId];
 
-    if (!state.folded) {
+    if (!state.folded && state.cards.length === 2) {
       state.hand = evaluateHand(state.cards);
     }
 
     resultPlayers.push({
       id: playerId,
       folded: state.folded,
+      allIn: state.allIn,
       totalContribution: state.totalContribution,
       cards: state.folded ? [] : state.cards,
       handName: state.folded ? null : state.hand?.name || null,
     });
   }
 
-  // 판돈 분배(동률 시 균등 분배 + 나머지는 앞쪽 승자부터 1조각씩)
-  const payouts = {};
-  let base = Math.floor(game.pot / winnerIds.length);
-  let remainder = game.pot % winnerIds.length;
+  const { payouts, historyRows } = calculatePayoutsAndHistory(room, timestamp);
 
-  for (const winnerId of winnerIds) {
-    payouts[winnerId] = base + (remainder > 0 ? 1 : 0);
-    if (remainder > 0) remainder -= 1;
-  }
-
-  for (const winnerId of winnerIds) {
-    await changePlayerPieces(room, winnerId, payouts[winnerId]);
-  }
-
-  // 전적 기록 저장
-  // 패자의 잃은 금액을 승자 수만큼 나눠서 기록합니다.
-  const historyRows = [];
-  const losers = game.turnOrder.filter((playerId) => !winnerIds.includes(playerId));
-
-  for (const loserId of losers) {
-    const lostAmount = game.playerStates[loserId].totalContribution;
-    const shareBase = Math.floor(lostAmount / winnerIds.length);
-    let shareRemainder = lostAmount % winnerIds.length;
-
-    for (const winnerId of winnerIds) {
-      const share = shareBase + (shareRemainder > 0 ? 1 : 0);
-      if (shareRemainder > 0) shareRemainder -= 1;
-
-      if (share > 0) {
-        historyRows.push({
-          winner_id: winnerId,
-          loser_id: loserId,
-          bet_amount: share,
-          timestamp,
-        });
-      }
+  for (const playerId of Object.keys(payouts)) {
+    if (payouts[playerId] > 0) {
+      await changePlayerPieces(room, playerId, payouts[playerId]);
     }
   }
 
-  await insertGameHistory(historyRows);
+  if (historyRows.length > 0) {
+    await insertGameHistory(historyRows);
+  }
+
+  // 메세지용 승자 목록이 없으면, 실제 수익이 가장 큰 플레이어(들)를 사용
+  let finalWinnerIds = winnerIdsForMessage;
+  if (!Array.isArray(finalWinnerIds) || finalWinnerIds.length === 0) {
+    const maxPayout = Math.max(...Object.values(payouts));
+    finalWinnerIds = Object.keys(payouts).filter((playerId) => payouts[playerId] === maxPayout);
+  }
 
   room.lastResult = {
     reason,
     pot: game.pot,
     timestamp,
-    winners: winnerIds.map((winnerId) => ({
+    winners: finalWinnerIds.map((winnerId) => ({
       id: winnerId,
-      payout: payouts[winnerId],
+      payout: payouts[winnerId] || 0,
       handName: game.playerStates[winnerId]?.hand?.name || '자동 승리',
     })),
     players: resultPlayers,
   };
 
-  addRoomMessage(
-    room,
-    winnerIds.length === 1
-      ? `${winnerIds[0]}님이 승리하여 ${payouts[winnerIds[0]]}조각을 획득했습니다. (${reason})`
-      : `${winnerIds.join(', ')}님이 공동 승리했습니다. (${reason})`
-  );
+  if (finalWinnerIds.length === 1) {
+    addRoomMessage(
+      room,
+      `${finalWinnerIds[0]}님이 승리했습니다. 최종 획득 ${payouts[finalWinnerIds[0]] || 0}조각 (${reason})`
+    );
+  } else {
+    addRoomMessage(
+      room,
+      `${finalWinnerIds.join(', ')}님이 공동 승리했습니다. (${reason})`
+    );
+  }
 
   room.game = null;
   room.status = 'lobby';
@@ -500,9 +567,6 @@ async function finishRound(room, winnerIds, reason) {
   emitRoomState(room);
 }
 
-/**
- * 쇼다운 처리.
- */
 async function showdown(room) {
   const activePlayerIds = getActivePlayerIds(room);
 
@@ -517,12 +581,6 @@ async function showdown(room) {
   await finishRound(room, winnerIds, '배팅 라운드 종료 후 패를 비교했습니다.');
 }
 
-/**
- * 액션 이후 게임 진행 상태를 판단합니다.
- * - 1명만 남으면 즉시 승리
- * - 모두 콜/체크 완료면 쇼다운
- * - 아니면 다음 차례 지정
- */
 async function resolveGameProgress(room, actorId) {
   if (!room.game) return;
 
@@ -533,7 +591,9 @@ async function resolveGameProgress(room, actorId) {
     return;
   }
 
-  if (room.game.needResponseFrom.size === 0) {
+  // 더 이상 행동 가능한 사람이 없으면 바로 쇼다운
+  const actionableIds = getActionablePlayerIds(room);
+  if (actionableIds.length === 0 || room.game.needResponseFrom.size === 0) {
     await showdown(room);
     return;
   }
@@ -543,9 +603,6 @@ async function resolveGameProgress(room, actorId) {
   emitRoomState(room);
 }
 
-/**
- * 게임 시작.
- */
 async function startGame(room) {
   clearAutoRestart(room);
 
@@ -557,7 +614,6 @@ async function startGame(room) {
     throw new Error('게임은 2명 이상 6명 이하일 때만 시작할 수 있습니다.');
   }
 
-  // 참가비 확인
   for (const player of room.players) {
     const enough = await hasEnoughChips(player.id, BASE_ANTE);
     if (!enough) {
@@ -565,7 +621,6 @@ async function startGame(room) {
     }
   }
 
-  // 참가비 차감
   for (const player of room.players) {
     await changePlayerPieces(room, player.id, -BASE_ANTE);
   }
@@ -573,20 +628,23 @@ async function startGame(room) {
   const rawDeck = createDeck();
   const deck = shuffleDeck(rawDeck);
 
-  // 라운드 시작 위치를 매 판 한 칸씩 밀어 공정성을 조금 더 확보합니다.
   room.dealerIndex = (room.dealerIndex + 1) % room.players.length;
   const turnOrder = rotateArray(getRoomPlayerIds(room), room.dealerIndex + 1);
 
   const playerStates = {};
   for (const playerId of turnOrder) {
+    const roomPlayer = getPlayerFromRoom(room, playerId);
     playerStates[playerId] = {
       cards: drawCards(deck, 2),
       folded: false,
+      allIn: roomPlayer ? roomPlayer.pieces === 0 : false,
       currentBet: 0,
       totalContribution: BASE_ANTE,
       hand: null,
     };
   }
+
+  const initialActionableIds = turnOrder.filter((playerId) => !playerStates[playerId].allIn);
 
   room.game = {
     phase: 'betting',
@@ -594,20 +652,24 @@ async function startGame(room) {
     pot: room.players.length * BASE_ANTE,
     currentBet: 0,
     turnOrder,
-    currentTurnPlayerId: turnOrder[0],
-    needResponseFrom: new Set(turnOrder),
+    currentTurnPlayerId: initialActionableIds[0] || null,
+    needResponseFrom: new Set(initialActionableIds),
     playerStates,
   };
 
   room.lastResult = null;
   room.status = 'playing';
   addRoomMessage(room, `새 게임이 시작되었습니다. 참가비 ${BASE_ANTE}조각이 차감되었습니다.`);
+
+  // 참가비를 내자마자 올인이 된 사람들만 있으면 바로 쇼다운
+  if (room.game.needResponseFrom.size === 0) {
+    await showdown(room);
+    return;
+  }
+
   emitRoomState(room);
 }
 
-/**
- * 배팅 입력값을 안전하게 정수로 변환.
- */
 function parsePositiveInteger(rawValue) {
   const value = Number(rawValue);
   if (!Number.isInteger(value)) return null;
@@ -615,10 +677,6 @@ function parsePositiveInteger(rawValue) {
   return value;
 }
 
-/**
- * 전체 룸 중 특정 플레이어가 있는 룸을 찾습니다.
- * 개발자 지급 기능에서 사용합니다.
- */
 function findRoomContainingPlayer(playerId) {
   for (const room of rooms.values()) {
     if (room.players.some((player) => player.id === playerId)) {
@@ -629,9 +687,7 @@ function findRoomContainingPlayer(playerId) {
 }
 
 io.on('connection', (socket) => {
-  // ---------------------------------------------------------
   // 방 생성
-  // ---------------------------------------------------------
   socket.on('createRoom', async ({ nickname }) => {
     try {
       if (socket.data.roomCode) {
@@ -690,9 +746,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 방 참가
-  // ---------------------------------------------------------
   socket.on('joinRoom', async ({ nickname, roomCode }) => {
     try {
       if (socket.data.roomCode) {
@@ -756,9 +810,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 방 나가기
-  // ---------------------------------------------------------
   socket.on('leaveRoom', async () => {
     try {
       await removePlayerFromRoom(socket, '방을 나갔습니다.');
@@ -769,9 +821,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 게임 시작 (방장만 가능)
-  // ---------------------------------------------------------
   socket.on('startGame', async () => {
     try {
       const roomCode = socket.data.roomCode;
@@ -795,9 +845,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 게임 액션 처리: call / bet / fold
-  // ---------------------------------------------------------
   socket.on('gameAction', async ({ type, amount }) => {
     try {
       const roomCode = socket.data.roomCode;
@@ -827,22 +875,37 @@ io.on('connection', (socket) => {
         return;
       }
 
-      const toCall = room.game.currentBet - state.currentBet;
+      if (state.allIn) {
+        emitError(socket, '이미 올인 상태라 추가 행동을 할 수 없습니다.');
+        return;
+      }
 
+      const toCall = Math.max(0, room.game.currentBet - state.currentBet);
+
+      // -----------------------------------------------------
+      // 콜 / 체크
+      // -----------------------------------------------------
       if (type === 'call') {
-        if (toCall > player.pieces) {
-          emitError(socket, '콜할 조각이 부족합니다. 다이를 선택하거나 적은 판에서 다시 시작해 주세요.');
-          return;
-        }
+        // 상대가 더 많이 걸었더라도, 내 조각이 부족하면 가능한 만큼만 넣고 올인 처리
+        const actualCall = Math.min(toCall, player.pieces);
 
-        if (toCall > 0) {
-          await changePlayerPieces(room, playerId, -toCall);
-          state.currentBet += toCall;
-          state.totalContribution += toCall;
-          room.game.pot += toCall;
-          addRoomMessage(room, `${playerId}님이 콜(${toCall}조각) 했습니다.`);
-        } else {
+        if (toCall === 0) {
           addRoomMessage(room, `${playerId}님이 체크했습니다.`);
+        } else if (actualCall > 0) {
+          await changePlayerPieces(room, playerId, -actualCall);
+          state.currentBet += actualCall;
+          state.totalContribution += actualCall;
+          room.game.pot += actualCall;
+
+          if (player.pieces === 0) {
+            state.allIn = true;
+            addRoomMessage(room, `${playerId}님이 ${actualCall}조각 콜하고 올인했습니다.`);
+          } else {
+            addRoomMessage(room, `${playerId}님이 콜(${actualCall}조각) 했습니다.`);
+          }
+        } else {
+          emitError(socket, '베팅할 조각이 없습니다.');
+          return;
         }
 
         room.game.needResponseFrom.delete(playerId);
@@ -850,6 +913,9 @@ io.on('connection', (socket) => {
         return;
       }
 
+      // -----------------------------------------------------
+      // 베팅 / 레이즈 / 올인 레이즈
+      // -----------------------------------------------------
       if (type === 'bet') {
         const raiseAmount = parsePositiveInteger(amount);
         if (!raiseAmount) {
@@ -857,32 +923,61 @@ io.on('connection', (socket) => {
           return;
         }
 
-        const totalNeed = toCall + raiseAmount;
-        if (totalNeed > player.pieces) {
-          emitError(socket, '베팅할 조각이 부족합니다.');
+        const wantedTotalSpend = toCall + raiseAmount;
+        const actualTotalSpend = Math.min(wantedTotalSpend, player.pieces);
+
+        if (actualTotalSpend <= 0) {
+          emitError(socket, '베팅할 조각이 없습니다.');
           return;
         }
 
-        await changePlayerPieces(room, playerId, -totalNeed);
-        state.currentBet += totalNeed;
-        state.totalContribution += totalNeed;
-        room.game.pot += totalNeed;
-        room.game.currentBet = state.currentBet;
+        const actualCall = Math.min(toCall, actualTotalSpend);
+        const actualRaise = Math.max(0, actualTotalSpend - actualCall);
+        const previousCurrentBet = room.game.currentBet;
 
-        // 레이즈가 발생했으므로, 본인을 제외한 살아있는 플레이어가 다시 응답해야 합니다.
-        room.game.needResponseFrom = new Set(
-          getActivePlayerIds(room).filter((id) => id !== playerId)
-        );
+        await changePlayerPieces(room, playerId, -actualTotalSpend);
+        state.currentBet += actualTotalSpend;
+        state.totalContribution += actualTotalSpend;
+        room.game.pot += actualTotalSpend;
 
-        addRoomMessage(
-          room,
-          `${playerId}님이 ${raiseAmount}조각 추가 베팅했습니다. (총 맞춰야 할 현재 베팅: ${room.game.currentBet})`
-        );
+        // 이번 행동으로 현재 최고 베팅이 더 높아졌다면 갱신
+        if (state.currentBet > room.game.currentBet) {
+          room.game.currentBet = state.currentBet;
+        }
+
+        if (player.pieces === 0) {
+          state.allIn = true;
+        }
+
+        // 실제로 currentBet이 올라간 경우만 다른 사람들의 추가 응답이 필요함
+        if (room.game.currentBet > previousCurrentBet) {
+          rebuildNeedResponseFrom(room, playerId);
+        } else {
+          room.game.needResponseFrom.delete(playerId);
+        }
+
+        if (state.allIn) {
+          addRoomMessage(
+            room,
+            `${playerId}님이 ${actualTotalSpend}조각 올인했습니다.` +
+              (actualRaise > 0 ? ` (콜 ${actualCall} + 추가 ${actualRaise})` : '')
+          );
+        } else {
+          addRoomMessage(
+            room,
+            `${playerId}님이 ${actualTotalSpend}조각 베팅했습니다.` +
+              (actualRaise > 0 ? ` (콜 ${actualCall} + 추가 ${actualRaise})` : '') +
+              ` 현재 최고 베팅: ${room.game.currentBet}`
+          );
+        }
 
         await resolveGameProgress(room, playerId);
         return;
       }
 
+      // -----------------------------------------------------
+      // 다이
+      // -----------------------------------------------------
       if (type === 'fold') {
         state.folded = true;
         room.game.needResponseFrom.delete(playerId);
@@ -898,12 +993,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 개발자 전용 조각 지급 기능
-  // 사용 조건:
-  // 1) 접속한 닉네임이 DEV_NICK 이어야 함
-  // 2) secret 값이 ADMIN_SECRET 과 일치해야 함
-  // ---------------------------------------------------------
   socket.on('adminGrantPieces', async ({ targetNickname, amount, secret }) => {
     try {
       const sender = socket.data.nickname;
@@ -954,9 +1044,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ---------------------------------------------------------
   // 연결 해제
-  // ---------------------------------------------------------
   socket.on('disconnect', async () => {
     try {
       await removePlayerFromRoom(socket, '연결이 종료되었습니다.');
