@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>섯다 멀티플레이</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="top-header">
+        <h1>섯다 멀티플레이</h1>
+        <p class="subtitle">닉네임만 입력해서 2~6명이 함께 플레이하세요</p>
+      </header>
+
+      <section id="lobbyScreen" class="panel lobby-panel">
+        <h2>메인 화면</h2>
+
+        <label class="field-label" for="nicknameInput">닉네임</label>
+        <input id="nicknameInput" class="text-input" type="text" maxlength="12" placeholder="닉네임 입력" />
+
+        <div class="lobby-actions">
+          <button id="createRoomBtn" class="primary-btn">방 만들기</button>
+        </div>
+
+        <div class="divider"></div>
+
+        <label class="field-label" for="roomCodeInput">방 코드</label>
+        <input id="roomCodeInput" class="text-input" type="text" maxlength="6" placeholder="예: AB12CD" />
+
+        <button id="joinRoomBtn" class="secondary-btn">방 참가</button>
+
+        <div class="notice-box">
+          <p>기본 규칙</p>
+          <ul>
+            <li>매 판 참가비 1조각 자동 차감</li>
+            <li>서버가 카드 분배와 승패를 모두 판정</li>
+            <li>베팅 금액은 직접 입력</li>
+            <li>판 종료 후 5초 뒤 자동으로 다음 판 시작</li>
+          </ul>
+        </div>
+      </section>
+
+      <section id="gameScreen" class="hidden">
+        <div class="room-code-box">
+          <span class="room-code-label">현재 방 코드</span>
+          <strong id="roomCodeDisplay" class="room-code-value">-</strong>
+        </div>
+
+        <div class="game-top-bar panel">
+          <div>
+            <div class="small-label">내 닉네임</div>
+            <div id="myIdDisplay" class="info-value">-</div>
+          </div>
+          <div>
+            <div class="small-label">방장</div>
+            <div id="hostDisplay" class="info-value">-</div>
+          </div>
+          <div>
+            <div class="small-label">현재 판돈</div>
+            <div id="potDisplay" class="info-value">0</div>
+          </div>
+          <div>
+            <div class="small-label">현재 맞춰야 할 베팅</div>
+            <div id="currentBetDisplay" class="info-value">0조각</div>
+          </div>
+        </div>
+
+        <div id="turnBanner" class="turn-banner">방에서 플레이어를 기다리는 중입니다.</div>
+        <div id="autoRestartBanner" class="auto-restart-banner hidden"></div>
+
+        <div class="game-layout">
+          <section class="table-panel panel">
+            <div class="section-title-row compact">
+              <h3>테이블</h3>
+              <div class="table-actions">
+                <button id="startGameBtn" class="primary-btn small-btn">게임 시작</button>
+                <button id="leaveRoomBtn" class="ghost-btn">방 나가기</button>
+              </div>
+            </div>
+
+            <div id="playersList" class="players-list table-grid"></div>
+
+            <div class="my-seat-box">
+              <div class="section-title-row compact no-margin">
+                <h3>내 패</h3>
+              </div>
+              <div id="myHandSummary" class="my-hand-summary">아직 게임이 시작되지 않았습니다.</div>
+              <div id="myCards" class="cards-row my-cards-row"></div>
+            </div>
+
+            <div id="lastResultBox" class="result-box hidden"></div>
+          </section>
+
+          <aside class="side-panel">
+            <div class="betting-panel panel">
+              <h3>베팅</h3>
+              <label class="field-label" for="betAmountInput">추가로 올릴 베팅 금액</label>
+              <input id="betAmountInput" class="text-input" type="number" min="1" step="1" placeholder="예: 5" />
+
+              <div class="betting-buttons">
+                <button id="callBtn" class="secondary-btn">콜 / 체크</button>
+                <button id="betBtn" class="primary-btn">베팅</button>
+                <button id="foldBtn" class="danger-btn">다이</button>
+              </div>
+            </div>
+
+            <section id="developerPanel" class="developer-panel panel hidden">
+              <h3>개발자 조각 지급</h3>
+              <p class="developer-help">개발자 닉네임으로 접속하고, 비밀키를 입력해야 동작합니다.</p>
+              <label class="field-label" for="devTargetInput">대상 닉네임</label>
+              <input id="devTargetInput" class="text-input" type="text" placeholder="지급 대상 닉네임" />
+
+              <label class="field-label" for="devAmountInput">변경 조각 수</label>
+              <input id="devAmountInput" class="text-input" type="number" step="1" placeholder="예: 100" />
+
+              <label class="field-label" for="devSecretInput">관리자 비밀키</label>
+              <input id="devSecretInput" class="text-input" type="password" placeholder="ADMIN_SECRET" />
+
+              <button id="devGrantBtn" class="primary-btn">조각 변경 실행</button>
+              <div id="devResult" class="developer-result"></div>
+            </section>
+
+            <section class="panel log-panel">
+              <div class="section-title-row compact no-margin">
+                <h3>게임 로그</h3>
+              </div>
+              <div id="logBox" class="log-box"></div>
+            </section>
+          </aside>
+        </div>
+      </section>
+    </main>
+
+    <div id="toast" class="toast hidden"></div>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="/client.js"></script>
+  </body>
+</html>
